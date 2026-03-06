@@ -5,7 +5,7 @@ set -euo pipefail
 # Proxmox VM Clone + Expand Tool (Fully Upgraded)
 #
 # Features & Fixes:
-# • Reliable snapshot detection that avoids duplicate "pre-clone"
+# • Idempotent snapshot handling: reuses existing 'pre-clone'
 # • Automatic disk expansion after cloning
 # • Filesystem resize according to root partition type
 # • Post-clone verification: df, lsblk, hostnamectl
@@ -189,11 +189,11 @@ detect_storage
 check_storage
 
 # --------------------------
-# Snapshot handling: robust
+# Snapshot handling: idempotent, reuse existing
 # --------------------------
 if [ "$DRY_RUN" = false ]; then
     if qm listsnapshot "$SOURCE_VMID" 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "pre-clone"; then
-        log "Snapshot 'pre-clone' exists, skipping creation"
+        log "Snapshot 'pre-clone' exists, reusing it"
     else
         log "Creating snapshot 'pre-clone'"
         run qm snapshot "$SOURCE_VMID" pre-clone
