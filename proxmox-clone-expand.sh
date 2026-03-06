@@ -4,21 +4,18 @@ set -euo pipefail
 # ==============================================================
 # Proxmox VM Clone + Expand Tool (Fully Upgraded)
 #
-# Features
-# --------
-# • Detects existing snapshot "pre-clone" and skips creation
-# • Safe dry-run simulation
-# • Pre-flight validation
-# • Automatic disk detection
-# • Thin pool space validation
-# • Guest agent wait
-# • Automatic filesystem expansion
-# • LVM detection support
-# • Post-clone verification
+# This version ensures:
+# • Existing snapshot detection ("pre-clone") to avoid duplicate snapshots
+# • Automatic disk expansion after cloning
+# • Guest filesystem resize according to partition type
+# • Post-clone verification: df, lsblk, hostname
+# • Dry-run mode for safe simulation
+# • Pre-flight validation for source VM and target VMID
 # • Full logging to /var/log/proxmox-clone-expand.log
 # ==============================================================
 
 LOG_FILE="/var/log/proxmox-clone-expand.log"
+
 SOURCE_VMID=""
 NEW_VMID=""
 NEW_NAME=""
@@ -29,6 +26,9 @@ MAX_GUEST_WAIT=180
 GUEST_RETRY_INTERVAL=5
 MAX_GROWPART_RETRIES=8
 
+# --------------------------------------------------------------
+# Logging functions
+# --------------------------------------------------------------
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 
 run() {
@@ -81,7 +81,7 @@ parse_args() {
 }
 
 # --------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight validation
 # --------------------------------------------------------------
 preflight_checks() {
     command -v qm >/dev/null || { log "ERROR: qm CLI not found"; exit 1; }
@@ -98,7 +98,7 @@ preflight_checks() {
 }
 
 # --------------------------------------------------------------
-# Wait for guest agent
+# Guest agent wait
 # --------------------------------------------------------------
 wait_guest_agent() {
     local vm="$1"
@@ -127,7 +127,7 @@ verify_post_clone() {
 }
 
 # --------------------------------------------------------------
-# Detect storage
+# Storage detection
 # --------------------------------------------------------------
 detect_storage() {
     if [ "$DRY_RUN" = false ]; then
@@ -135,15 +135,12 @@ detect_storage() {
             | grep -E '^(scsi|virtio|sata|ide)0' \
             | cut -d':' -f2 \
             | cut -d',' -f1 \
-            | xargs)   # trim whitespace
+            | xargs)  # trim whitespace
     else
         STORAGE=$(simulate "local-lvm")
     fi
 
-    if [[ -z "$STORAGE" ]]; then
-        log "ERROR: could not detect storage"; exit 1
-    fi
-
+    [[ -z "$STORAGE" ]] && { log "ERROR: could not detect storage"; exit 1; }
     log "Detected storage: $STORAGE"
 }
 
@@ -153,17 +150,12 @@ detect_storage() {
 check_storage() {
     local req=$(echo "$EXPAND_SIZE" | sed 's/G//')
     local free
-
     if [ "$DRY_RUN" = false ]; then
         free=$(pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4}' | sed 's/G//')
     else
         free=500
     fi
-
-    if (( free < req )); then
-        log "ERROR: insufficient storage ($free G available)"; exit 1
-    fi
-
+    (( free < req )) && { log "ERROR: insufficient storage ($free G available)"; exit 1; }
     log "Available storage: ${free}G"
 }
 
@@ -176,13 +168,12 @@ detect_disk() {
     else
         DISK="scsi0"
     fi
-
     [[ -z "$DISK" ]] && { log "ERROR: cannot detect disk"; exit 1; }
     log "Primary disk: $DISK"
 }
 
 # --------------------------------------------------------------
-# Root partition detection
+# Detect root partition
 # --------------------------------------------------------------
 detect_root_partition() {
     if [ "$DRY_RUN" = false ]; then
@@ -190,7 +181,6 @@ detect_root_partition() {
     else
         ROOT_PART="sda1"
     fi
-
     [[ -z "$ROOT_PART" ]] && { log "ERROR: root partition detection failed"; exit 1; }
 
     log "Root partition: $ROOT_PART"
@@ -199,7 +189,7 @@ detect_root_partition() {
 }
 
 # --------------------------------------------------------------
-# Filesystem resize
+# Expand filesystem
 # --------------------------------------------------------------
 expand_filesystem() {
     local FS_TYPE
@@ -215,7 +205,6 @@ expand_filesystem() {
         btrfs) run qm guest exec "$NEW_VMID" -- btrfs filesystem resize max / ;;
         *) log "WARNING: unknown filesystem $FS_TYPE" ;;
     esac
-
     log "Filesystem expansion completed."
 }
 
@@ -235,7 +224,7 @@ preflight_checks
 detect_storage
 check_storage
 
-# Snapshot handling
+# Snapshot handling: skip if "pre-clone" exists
 if [ "$DRY_RUN" = false ]; then
     if qm listsnapshot "$SOURCE_VMID" | grep -q '^pre-clone'; then
         log "Snapshot 'pre-clone' exists, skipping creation"
@@ -247,26 +236,33 @@ else
     log "[DRY-RUN] Snapshot check simulated"
 fi
 
-# Clone without specifying snapshot
+# Clone VM (without snapshot argument to avoid "Unknown option")
 log "Cloning VM"
 run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true
 
 detect_disk
 
+# Expand disk to requested size
 log "Expanding disk"
 run qm resize "$NEW_VMID" "$DISK" "$EXPAND_SIZE"
 
+# Start VM
 log "Starting VM"
 run qm start "$NEW_VMID"
 
+# Wait for guest agent if not dry-run
 [ "$DRY_RUN" = false ] && wait_guest_agent "$NEW_VMID" || log "[DRY-RUN] Guest agent wait simulated"
 
+# Detect root partition and expand filesystem
 detect_root_partition
 run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM"
 expand_filesystem
+
+# Set hostname and generate SSH host keys
 run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME"
 run qm guest exec "$NEW_VMID" -- ssh-keygen -A
 
+# Post-clone verification
 verify_post_clone "$NEW_VMID"
 
 log "==== COMPLETE ===="
