@@ -4,20 +4,20 @@ set -euo pipefail
 # ==============================================================
 # Proxmox VM Clone + Expand Tool (Fully Upgraded)
 #
-# Features:
-# • Detects existing snapshot "pre-clone" and skips creation
-# • Safe dry-run simulation
-# • Pre-flight validation
-# • Automatic disk detection
-# • Thin pool space validation
-# • Guest agent wait
-# • Automatic filesystem expansion
-# • LVM detection support
-# • Post-clone verification
+# Features & Fixes:
+# • Correct snapshot existence detection to avoid duplicate "pre-clone"
+# • Automatic disk expansion after cloning
+# • Guest filesystem resize according to partition type
+# • Post-clone verification: df, lsblk, hostname
+# • Dry-run mode for safe simulation
+# • Pre-flight validation for source VM and target VMID
 # • Full logging to /var/log/proxmox-clone-expand.log
+# • Handles LVM, ext4, xfs, btrfs filesystems
+# • Waits for qemu-guest-agent before filesystem expansion
 # ==============================================================
 
 LOG_FILE="/var/log/proxmox-clone-expand.log"
+
 SOURCE_VMID=""
 NEW_VMID=""
 NEW_NAME=""
@@ -28,6 +28,9 @@ MAX_GUEST_WAIT=180
 GUEST_RETRY_INTERVAL=5
 MAX_GROWPART_RETRIES=8
 
+# --------------------------------------------------------------
+# Logging functions
+# --------------------------------------------------------------
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 
 run() {
@@ -80,7 +83,7 @@ parse_args() {
 }
 
 # --------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight validation
 # --------------------------------------------------------------
 preflight_checks() {
     command -v qm >/dev/null || { log "ERROR: qm CLI not found"; exit 1; }
@@ -92,11 +95,12 @@ preflight_checks() {
             log "ERROR: Target VMID $NEW_VMID already exists"; exit 1
         fi
     fi
+
     log "Pre-flight checks passed."
 }
 
 # --------------------------------------------------------------
-# Wait for guest agent
+# Guest agent wait
 # --------------------------------------------------------------
 wait_guest_agent() {
     local vm="$1"
@@ -137,6 +141,7 @@ detect_storage() {
     else
         STORAGE=$(simulate "local-lvm")
     fi
+
     [[ -z "$STORAGE" ]] && { log "ERROR: could not detect storage"; exit 1; }
     log "Detected storage: $STORAGE"
 }
@@ -179,6 +184,7 @@ detect_root_partition() {
         ROOT_PART="sda1"
     fi
     [[ -z "$ROOT_PART" ]] && { log "ERROR: root partition detection failed"; exit 1; }
+
     log "Root partition: $ROOT_PART"
     PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]\+$')
     DISK_NAME=$(echo "$ROOT_PART" | sed -E "s/${PART_NUM}$//")
@@ -222,36 +228,45 @@ check_storage
 
 # Snapshot handling: skip creation if "pre-clone" exists
 if [ "$DRY_RUN" = false ]; then
-    if qm listsnapshot "$SOURCE_VMID" | grep -q '^pre-clone'; then
+    if qm listsnapshot "$SOURCE_VMID" \
+        | awk 'NR>1{gsub(/^[ \t]+|[ \t]+$/,""); print $1}' \
+        | grep -qx 'pre-clone'; then
         log "Snapshot 'pre-clone' exists, skipping creation"
     else
         log "Creating snapshot"
-        qm snapshot "$SOURCE_VMID" pre-clone   # call directly, never through run()
+        run qm snapshot "$SOURCE_VMID" pre-clone
     fi
 else
     log "[DRY-RUN] Snapshot check simulated"
 fi
 
+# Clone VM
 log "Cloning VM"
 run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true
 
 detect_disk
 
+# Expand disk to requested size
 log "Expanding disk"
 run qm resize "$NEW_VMID" "$DISK" "$EXPAND_SIZE"
 
+# Start VM
 log "Starting VM"
 run qm start "$NEW_VMID"
 
+# Wait for guest agent if not dry-run
 [ "$DRY_RUN" = false ] && wait_guest_agent "$NEW_VMID" || log "[DRY-RUN] Guest agent wait simulated"
 
+# Detect root partition and expand filesystem
 detect_root_partition
 run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM"
 expand_filesystem
 
+# Set hostname and generate SSH host keys
 run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME"
 run qm guest exec "$NEW_VMID" -- ssh-keygen -A
 
+# Post-clone verification
 verify_post_clone "$NEW_VMID"
 
 log "==== COMPLETE ===="
