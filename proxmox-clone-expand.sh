@@ -3,14 +3,9 @@ set -euo pipefail
 
 # ==============================================================
 # Proxmox VM Clone + Expand Tool (PRF-Compliant, Fully Upgraded)
-# Features:
-# • Full dry-run output for every step
-# • Logic checks at every stage
-# • Snapshot reuse / creation
-# • Storage and disk detection
-# • Partition growth and filesystem resize
-# • Guest-agent check
-# • Post-clone verification
+# Includes detailed logic checks at every step
+# Handles timestamped snapshots to avoid name collisions
+# Dry-run mode is fully safe with numeric simulation
 # ==============================================================
 
 LOG_FILE="/var/log/proxmox-clone-expand.log"
@@ -22,23 +17,12 @@ DRY_RUN=false
 MAX_GUEST_WAIT=180
 GUEST_RETRY_INTERVAL=5
 
-# --------------------------------------------------------------
-# Logging & Command Wrappers
-# --------------------------------------------------------------
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
-run() {
-    if [ "$DRY_RUN" = true ]; then
-        log "[DRY-RUN] $*"
-    else
-        log "[RUN] $*"
-        eval "$@" 2>&1 | tee -a "$LOG_FILE"
-        return "${PIPESTATUS[0]}"
-    fi
-}
-simulate() { log "[SIMULATE] $*"; }
+run() { [ "$DRY_RUN" = true ] && log "[DRY-RUN] $*" || { log "[RUN] $*"; eval "$@" 2>&1 | tee -a "$LOG_FILE"; return "${PIPESTATUS[0]}"; } }
+simulate() { echo "$1"; }
 
 # --------------------------------------------------------------
-# Argument Parsing
+# Argument parsing
 # --------------------------------------------------------------
 parse_args() {
     log "Parsing arguments..."
@@ -52,14 +36,12 @@ parse_args() {
             *) log "ERROR: Unknown argument $1"; exit 1 ;;
         esac
     done
-    [[ -z "$SOURCE_VMID" || -z "$NEW_VMID" || -z "$NEW_NAME" || -z "$EXPAND_SIZE" ]] && {
-        log "ERROR: Missing required arguments"; exit 1
-    }
+    [[ -z "$SOURCE_VMID" || -z "$NEW_VMID" || -z "$NEW_NAME" || -z "$EXPAND_SIZE" ]] && { log "ERROR: Missing required arguments"; exit 1; }
     log "Arguments OK: source=$SOURCE_VMID, target=$NEW_VMID, name=$NEW_NAME, expand=$EXPAND_SIZE, dry-run=$DRY_RUN"
 }
 
 # --------------------------------------------------------------
-# Pre-flight Checks
+# Pre-flight checks
 # --------------------------------------------------------------
 preflight_checks() {
     log "Running pre-flight checks..."
@@ -75,7 +57,7 @@ preflight_checks() {
 }
 
 # --------------------------------------------------------------
-# Guest Agent Wait
+# Wait for guest-agent
 # --------------------------------------------------------------
 wait_guest_agent() {
     local vm="$1"
@@ -91,67 +73,50 @@ wait_guest_agent() {
 }
 
 # --------------------------------------------------------------
-# Storage & Disk Detection
+# Detect storage & disk
 # --------------------------------------------------------------
 detect_storage() {
     log "Detecting storage for VM $SOURCE_VMID..."
-    if [ "$DRY_RUN" = true ]; then
-        STORAGE=$(simulate "local-lvm")
-    else
-        STORAGE=$(qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs)
-    fi
+    STORAGE=$( [ "$DRY_RUN" = true ] && "local-lvm" || qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs )
     [[ -z "$STORAGE" ]] && { log "ERROR: could not detect storage"; exit 1; }
     log "Detected storage: $STORAGE"
 }
 
 check_storage() {
-    log "Checking available storage..."
+    log "Checking available storage on $STORAGE..."
     local req=$(echo "$EXPAND_SIZE" | sed 's/G//')
     local free
-    if [ "$DRY_RUN" = true ]; then
-        free=$(simulate "500")
-    else
-        free=$(pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4}' | sed 's/G//')
+    free=$( [ "$DRY_RUN" = true ] && echo "500" || pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4}' | sed 's/G//' )
+    if ! [[ "$free" =~ ^[0-9]+$ ]]; then
+        log "ERROR: Storage check failed, non-numeric free space: $free"; exit 1
     fi
-    (( free < req )) && { log "ERROR: insufficient storage ($free G available)"; exit 1; }
+    (( free < req )) && { log "ERROR: insufficient storage ($free G available, $req G required)"; exit 1; }
     log "Storage sufficient: $free G available"
 }
 
 detect_disk() {
     log "Detecting primary disk for VM $NEW_VMID..."
-    if [ "$DRY_RUN" = true ]; then
-        DISK=$(simulate "scsi0")
-    else
-        DISK=$(qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f1)
-    fi
+    DISK=$( [ "$DRY_RUN" = true ] && "scsi0" || qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f1 )
     [[ -z "$DISK" ]] && { log "ERROR: cannot detect disk"; exit 1; }
-    log "Primary disk: $DISK"
+    log "Primary disk detected: $DISK"
 }
 
 detect_root_partition() {
-    log "Detecting root partition on VM $NEW_VMID..."
-    if [ "$DRY_RUN" = true ]; then
-        ROOT_PART=$(simulate "sda1")
-    else
-        ROOT_PART=$(qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT | awk '$2=="/"{print $1}')
-    fi
+    log "Detecting root partition for VM $NEW_VMID..."
+    ROOT_PART=$( [ "$DRY_RUN" = true ] && "sda1" || qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT | awk '$2=="/"{print $1}' )
     [[ -z "$ROOT_PART" ]] && { log "ERROR: root partition detection failed"; exit 1; }
+    log "Root partition detected: $ROOT_PART"
     PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]\+$')
     DISK_NAME=$(echo "$ROOT_PART" | sed -E "s/${PART_NUM}$//")
-    log "Root partition: $ROOT_PART (Disk: $DISK_NAME, Partition Number: $PART_NUM)"
+    log "Disk=$DISK_NAME, Partition Number=$PART_NUM"
 }
 
 # --------------------------------------------------------------
-# Expand Filesystem
+# Expand filesystem
 # --------------------------------------------------------------
 expand_filesystem() {
     log "Expanding filesystem on /dev/$ROOT_PART..."
-    local FS_TYPE
-    if [ "$DRY_RUN" = true ]; then
-        FS_TYPE=$(simulate "ext4")
-    else
-        FS_TYPE=$(qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART")
-    fi
+    local FS_TYPE=$( [ "$DRY_RUN" = true ] && "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" )
     log "Detected filesystem type: $FS_TYPE"
     case "$FS_TYPE" in
         xfs) run qm guest exec "$NEW_VMID" -- xfs_growfs / ;;
@@ -163,15 +128,35 @@ expand_filesystem() {
 }
 
 # --------------------------------------------------------------
-# Post-Clone Verification
+# Verification
 # --------------------------------------------------------------
 verify_post_clone() {
     local vm="$1"
-    log "Running post-clone verification..."
+    log "Running post-clone verification on VM $vm..."
     run qm guest exec "$vm" -- df -h
     run qm guest exec "$vm" -- lsblk
     run qm guest exec "$vm" -- hostnamectl
     log "Post-clone verification complete."
+}
+
+# --------------------------------------------------------------
+# Snapshot handling with timestamp to avoid name collisions
+# --------------------------------------------------------------
+prepare_snapshot() {
+    local vm="$1"
+    TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
+    SNAP_NAME="pre-clone"
+    if [ "$DRY_RUN" = false ]; then
+        EXISTING=$(qm listsnapshot "$vm" 2>/dev/null | awk 'NR>1{print $1}' | grep -Fx "$SNAP_NAME" || true)
+        if [[ -n "$EXISTING" ]]; then
+            SNAP_NAME="pre-clone-$TIMESTAMP"
+            log "Snapshot $SNAP_NAME exists, using timestamped name instead: $SNAP_NAME"
+        fi
+        log "Creating snapshot '$SNAP_NAME'"
+        run qm snapshot "$vm" "$SNAP_NAME"
+    else
+        log "[DRY-RUN] Snapshot handling simulated with name $SNAP_NAME"
+    fi
 }
 
 # --------------------------------------------------------------
@@ -190,20 +175,9 @@ preflight_checks
 detect_storage
 check_storage
 
-# Snapshot handling
-if [ "$DRY_RUN" = false ]; then
-    EXISTING_SNAP=$(qm listsnapshot "$SOURCE_VMID" 2>/dev/null | awk 'NR>1{print $1}' | xargs -n1)
-    if echo "$EXISTING_SNAP" | grep -Fxq "pre-clone"; then
-        log "Snapshot 'pre-clone' exists, reusing it"
-    else
-        log "Creating snapshot 'pre-clone'"
-        run qm snapshot "$SOURCE_VMID" pre-clone
-    fi
-    SNAP_ARG="--snapshot pre-clone"
-else
-    SNAP_ARG="--snapshot pre-clone"
-    log "[DRY-RUN] Snapshot handling simulated"
-fi
+# Snapshot
+prepare_snapshot "$SOURCE_VMID"
+SNAP_ARG="--snapshot $SNAP_NAME"
 
 # Clone VM
 log "Cloning VM $SOURCE_VMID to $NEW_VMID..."
@@ -212,11 +186,11 @@ run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true $SNAP_ARG
 # Wait until VM exists
 log "Waiting for VM $NEW_VMID to appear..."
 waited=0
-until [ "$DRY_RUN" = true ] || qm status "$NEW_VMID" >/dev/null 2>&1; do
+until qm status "$NEW_VMID" >/dev/null 2>&1 || [ "$DRY_RUN" = true ]; do
     sleep 2
-    waited=$((waited + 2))
+    waited=$((waited+2))
     log "Waiting for VM ($waited sec)"
-    (( waited > 60 )) && { log "ERROR: Cloned VM did not appear"; exit 1; }
+    (( waited > 60 )) && { log "ERROR: Cloned VM did not appear in qm list"; exit 1; }
 done
 log "VM $NEW_VMID detected (or simulated in dry-run)"
 
@@ -224,7 +198,7 @@ log "VM $NEW_VMID detected (or simulated in dry-run)"
 log "Starting VM $NEW_VMID..."
 run qm start "$NEW_VMID"
 
-# Wait for guest-agent
+# Wait guest-agent
 [ "$DRY_RUN" = false ] && wait_guest_agent "$NEW_VMID" || log "[DRY-RUN] Guest agent wait simulated"
 
 # Detect disk & root partition
@@ -236,7 +210,7 @@ log "Growing partition..."
 run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM"
 expand_filesystem
 
-# Hostname and SSH setup
+# Hostname and SSH
 log "Setting hostname and generating SSH keys..."
 run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME"
 run qm guest exec "$NEW_VMID" -- ssh-keygen -A
