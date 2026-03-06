@@ -2,13 +2,7 @@
 set -euo pipefail
 
 # ==============================================================
-# Proxmox VM Clone + Expand Tool (Fully Audit-Informed, Hardened)
-# Features:
-# - VM config & guest-agent readiness
-# - Storage & filesystem checks
-# - Timestamped snapshot
-# - Dry-run fully supported
-# - Full logic checks, retries, and detailed logging
+# Proxmox VM Clone + Expand Tool (Fully Audit-Informed, Failure-Resistant)
 # ==============================================================
 
 LOG_FILE="/var/log/proxmox-clone-expand.log"
@@ -23,9 +17,7 @@ GUEST_RETRY_INTERVAL=5
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 run() { [ "$DRY_RUN" = true ] && log "[DRY-RUN] $*" || { log "[RUN] $*"; eval "$@" 2>&1 | tee -a "$LOG_FILE"; return "${PIPESTATUS[0]}"; } }
 
-# --------------------------------------------------------------
-# Argument parsing
-# --------------------------------------------------------------
+# ------------------------- ARG PARSING ------------------------
 parse_args() {
     log "Parsing arguments..."
     while [[ $# -gt 0 ]]; do
@@ -42,9 +34,7 @@ parse_args() {
     log "Arguments OK: source=$SOURCE_VMID, target=$NEW_VMID, name=$NEW_NAME, expand=$EXPAND_SIZE, dry-run=$DRY_RUN"
 }
 
-# --------------------------------------------------------------
-# Pre-flight checks
-# --------------------------------------------------------------
+# ------------------------- PRE-FLIGHT --------------------------
 preflight_checks() {
     log "Running pre-flight checks..."
     command -v qm >/dev/null || { log "ERROR: qm CLI not found"; exit 1; }
@@ -58,9 +48,7 @@ preflight_checks() {
     log "Pre-flight checks passed."
 }
 
-# --------------------------------------------------------------
-# Wait for guest-agent readiness
-# --------------------------------------------------------------
+# ------------------------- GUEST AGENT ------------------------
 wait_guest_agent() {
     local vm="$1"
     log "Checking guest-agent on VM $vm..."
@@ -74,9 +62,7 @@ wait_guest_agent() {
     log "Guest agent active on VM $vm."
 }
 
-# --------------------------------------------------------------
-# Storage detection and check
-# --------------------------------------------------------------
+# ------------------------- STORAGE ----------------------------
 detect_storage() {
     log "Detecting storage for VM $SOURCE_VMID..."
     STORAGE=$( [ "$DRY_RUN" = true ] && echo "local-lvm" || qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs )
@@ -94,46 +80,42 @@ check_storage() {
     fi
     (( free < req )) && { log "ERROR: insufficient storage ($free G available, $req G required)"; exit 1; }
     log "Storage sufficient: $free G available"
+
+    if [ "$DRY_RUN" = false ]; then
+        THIN_TOTAL=$(lvs --noheadings -o lv_size --units G --nosuffix "$STORAGE" | awk '{s+=$1} END{print s}')
+        if (( THIN_TOTAL > free )); then
+            log "ERROR: Thin pool overcommit detected: total LV size ($THIN_TOTAL G) > free pool ($free G)"
+            exit 1
+        fi
+    fi
 }
 
-# --------------------------------------------------------------
-# Snapshot creation with timestamp
-# --------------------------------------------------------------
+# ------------------------- SNAPSHOT ---------------------------
 prepare_snapshot() {
     local vm="$1"
     local timestamp
     timestamp=$(date '+%Y%m%d-%H%M%S')
     local snap_name="pre-clone-$timestamp"
     log "Snapshot name set to: $snap_name"
-    if [ "$DRY_RUN" = false ]; then
-        run qm snapshot "$vm" "$snap_name"
-    else
-        log "[DRY-RUN] Snapshot handling simulated with name $snap_name"
-    fi
+    [ "$DRY_RUN" = false ] && run qm snapshot "$vm" "$snap_name" || log "[DRY-RUN] Snapshot simulated: $snap_name"
     SNAP_NAME="$snap_name"
 }
 
-# --------------------------------------------------------------
-# Wait for VM config after clone
-# --------------------------------------------------------------
+# ------------------------- VM CONFIG WAIT ---------------------
 wait_vm_config() {
     log "Waiting for VM $NEW_VMID config..."
     local tries=0
     while [ "$tries" -lt 20 ]; do
-        if [ "$DRY_RUN" = true ] || [ -f "/etc/pve/qemu-server/${NEW_VMID}.conf" ]; then
-            log "VM $NEW_VMID config detected."
-            return
-        fi
+        [ "$DRY_RUN" = true ] && break
+        [[ -f "/etc/pve/qemu-server/${NEW_VMID}.conf" ]] && { log "VM $NEW_VMID config detected."; return; }
         log "VM config not found yet, retrying..."
         sleep 2
         tries=$((tries+1))
     done
-    log "ERROR: VM config for $NEW_VMID not found"; exit 1
+    (( tries >= 20 )) && { log "ERROR: VM config for $NEW_VMID not found"; exit 1; }
 }
 
-# --------------------------------------------------------------
-# Disk and root partition detection
-# --------------------------------------------------------------
+# ------------------------- DISK DETECTION --------------------
 detect_disk() {
     log "Detecting primary disk for VM $NEW_VMID..."
     local tries=0
@@ -158,9 +140,7 @@ detect_root_partition() {
     log "Disk=$DISK_NAME, Partition Number=$PART_NUM"
 }
 
-# --------------------------------------------------------------
-# Expand filesystem
-# --------------------------------------------------------------
+# ------------------------- FILESYSTEM EXPANSION ----------------
 expand_filesystem() {
     log "Expanding filesystem on /dev/$ROOT_PART..."
     local FS_TYPE=$( [ "$DRY_RUN" = true ] && echo "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" )
@@ -174,9 +154,7 @@ expand_filesystem() {
     log "Filesystem expansion step completed."
 }
 
-# --------------------------------------------------------------
-# Post-clone verification
-# --------------------------------------------------------------
+# ------------------------- POST CLONE VERIFY -----------------
 verify_post_clone() {
     local vm="$1"
     log "Running post-clone verification on VM $vm..."
@@ -186,9 +164,7 @@ verify_post_clone() {
     log "Post-clone verification complete."
 }
 
-# --------------------------------------------------------------
-# MAIN
-# --------------------------------------------------------------
+# ------------------------- MAIN ------------------------------
 parse_args "$@"
 
 log "==== START Proxmox Clone + Expand ===="
@@ -205,7 +181,7 @@ check_storage
 prepare_snapshot "$SOURCE_VMID"
 
 log "Cloning VM $SOURCE_VMID to $NEW_VMID..."
-run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true --snapshot "$SNAP_NAME"
+run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true
 
 wait_vm_config
 
