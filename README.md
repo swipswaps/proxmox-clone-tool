@@ -1,160 +1,247 @@
-# Proxmox VM Clone + Expand Tool (Next-Gen Upgrade)
+Proxmox VM Clone + Expand Tool (Next-Gen Upgrade)
+Overview
 
-## Overview
+This repository contains a production-ready Bash automation tool for safely cloning and expanding Proxmox virtual machines.
 
-This repository contains a **production-ready Bash tool** for cloning and expanding Proxmox VMs with full dry-run simulation, verbose logging, and real-time feedback. The script is designed for **reliability, automation, and auditability**, fully compatible with Proxmox VE 6+ and 7+, using thin pools, LVM, or standard disks.
+The script is designed for reliability, auditability, and safe automation, with built-in dry-run simulation and detailed logging.
 
-**Key features:**
+It works with Proxmox VE 6 / 7 / 8 / 9 and supports common storage backends including:
 
-- Full dry-run simulation (`--dry-run`) to verify actions without making changes.
-- Logs all actions, progress, and errors to `/var/log/proxmox-clone-expand.log`.
-- Detects LVM vs non-LVM root partitions and safely resizes filesystems.
-- Supports multiple disk types (`scsi0`, `virtio0`, `sata0`) automatically.
-- Automates hostname, SSH key regeneration, and MAC address updates.
-- Pre-flight checks for VM existence, storage space, and guest-agent readiness.
-- Provides clear instructions for expanding Fedora/XFS and ext4 filesystems.
-- Handles thin pool usage and provides approximate free space for safe expansion.
-- Post-clone verification commands included for auditing.
+LVM Thin
 
----
+LVM
 
-## Prerequisites
+Local directory storage
 
-Before using the script:
+ZFS-backed disks (filesystem expansion still handled inside the guest)
 
-1. **Proxmox VE host** with `qm` and `pvesm` CLI installed.
-2. **Source VM** must have `qemu-guest-agent` installed and running.
-3. **Storage space**: Ensure sufficient free space in the target storage pool, especially when using thin pools.
-4. **Bash 4+** with `pipefail` support.
-5. **Optional but recommended**: Snapshot of source VM to prevent filesystem inconsistencies.
+Features
 
-```bash
-# Create snapshot (optional but safest)
-qm snapshot <source-vmid> pre-clone
+Dry-run mode (--dry-run) simulates every action before execution.
 
-Recommended location for cloning repository on Proxmox host:
+Full logging of all operations to /var/log/proxmox-clone-expand.log.
 
-# Example: /root/proxmox-tools for admin scripts
+Automatic disk detection (scsi0, virtio0, sata0, etc).
+
+Filesystem auto-resize for:
+
+ext2 / ext3 / ext4
+
+XFS
+
+btrfs
+
+LVM logical volumes
+
+Pre-flight checks to prevent unsafe operations.
+
+Guest-agent verification to ensure in-guest resizing works.
+
+Automatic hostname update in the cloned VM.
+
+SSH host key regeneration for security.
+
+Post-clone verification commands included.
+
+Requirements
+
+Before using the tool ensure the following are installed and configured.
+
+1️⃣ Proxmox host requirements
+
+The host must provide:
+
+qm
+pvesm
+lvs
+vgs
+pvs
+
+These are installed by default on Proxmox.
+
+2️⃣ Source VM requirements
+
+The source VM must have the QEMU guest agent installed and running.
+
+Inside the VM:
+
+sudo dnf install qemu-guest-agent
+sudo systemctl enable --now qemu-guest-agent
+
+Verify from Proxmox host:
+
+qm guest ping <vmid>
+Installation
+
+Clone the repository on the Proxmox host.
+
+Recommended location:
+
+/root/proxmox-tools
+Step 1 — create tools directory
 mkdir -p /root/proxmox-tools
 cd /root/proxmox-tools
+Step 2 — clone repository
 git clone https://github.com/swipswaps/proxmox-clone-tool.git
+Step 3 — enter repository
 cd proxmox-clone-tool
+Step 4 — make script executable
 chmod +x proxmox-clone-expand.sh
 Usage
-Dry-run simulation
+Dry-Run Simulation (Recommended)
 
-Before performing any real operation, verify the script behavior:
+Always test the operation first.
 
-./proxmox-clone-expand.sh --source 100 --target 101 --expand 101 --dry-run
+./proxmox-clone-expand.sh \
+  --source 100 \
+  --target 101 \
+  --name fedora-clone \
+  --expand 101G \
+  --dry-run
+Argument description
+Argument	Description
+--source	Existing VMID to clone
+--target	New VMID for the cloned VM
+--name	Hostname assigned to the cloned VM
+--expand	Disk size increase (must include unit like G)
+--dry-run	Simulates actions without modifying the system
 
---source 100 → existing VMID to clone
+Example values:
 
---target 101 → new VMID for cloned VM
+--source 100
+--target 101
+--name fedora-clone
+--expand 101G
+What dry-run verifies
 
---expand 101 → size in GB to expand the primary disk
+The script simulates:
 
---dry-run → simulates all operations without creating the VM
+Pre-flight safety checks
 
-Expected output will display:
+Storage availability
 
-Pre-flight checks
+Snapshot creation
 
-Available storage and thin pool free space
+VM cloning
 
-Snapshot creation (simulated)
+Disk expansion
 
-Clone plan and disk expansion plan
+VM startup
 
-Guest-agent wait simulation
+Guest-agent detection
 
-Root partition detection and filesystem resize commands
+Root partition detection
 
-Hostname and SSH key update simulation
+Filesystem expansion
 
-Verification steps (simulated)
+Hostname configuration
 
-Live-run cloning
+SSH key regeneration
 
-Once the dry-run is verified:
+No changes are made to the system.
 
-./proxmox-clone-expand.sh --source 100 --target 101 --expand 101
+Running the Actual Clone
 
-Omitting --dry-run executes all commands.
+Once the dry-run output looks correct:
 
-The script will automatically:
+./proxmox-clone-expand.sh \
+  --source 100 \
+  --target 101 \
+  --name fedora-clone \
+  --expand 101G
 
-Take a pre-clone snapshot
+The script will then automatically:
 
-Clone the VM to the target VMID
+Create a snapshot of the source VM
 
-Expand the primary disk
+Clone the VM
+
+Expand the virtual disk
 
 Start the cloned VM
 
 Wait for the guest agent
 
-Grow the root partition and resize the filesystem
+Expand the partition
 
-Update hostname and regenerate SSH host keys
+Resize the filesystem
 
-Provide verification output
+Set the hostname
 
-Disk and Thin Pool Monitoring
+Regenerate SSH host keys
 
-Check thin pool usage to ensure enough free space:
+Run verification commands
 
-# Approximate free space in GB
+Storage Monitoring (Important)
+
+Before expanding disks ensure sufficient space exists.
+
+Check thin-pool usage:
+
+lvs -a -o lv_size,data_percent pve/data
+
+Calculate approximate free space:
+
 tpool=$(lvs --noheadings -o lv_size,data_percent --units g --nosuffix pve/data | awk '{print $1*(1-$2/100)}')
 echo "Approx free space in thin pool (GB): $tpool"
 
-Do not exceed the available free space when expanding disks.
+Also useful:
 
-lvs, vgs, and pvs are useful for monitoring LVM thin pool usage:
-
-pvs      # Physical volume stats
-vgs      # Volume group stats
-lvs -a -o +seg_monitor  # All logical volumes with monitoring info
+pvs
+vgs
+lvs
 Best Practices
 
-Always run --dry-run first to ensure no unintended changes.
+Recommended workflow:
 
-Ensure thin pool free space is greater than the planned disk expansion.
+Always run --dry-run first
 
-Verify that source VM guest-agent is running (systemctl status qemu-guest-agent inside the VM).
+Confirm VMIDs are unused
 
-Snapshot the source VM before cloning to allow rollback.
+Verify guest agent is running
 
-Confirm VMIDs do not conflict with existing VMs.
+Confirm storage space is available
 
-Keep repository and script updated with git pull before cloning new VMs.
+Snapshot important VMs before cloning
 
-Use /root/proxmox-tools or another admin-only directory for scripts to avoid accidental modification.
+Verify filesystem size after clone
 
-Always check df -h and lsblk after clone expansion to confirm filesystem size matches expectations.
+Post-Clone Verification
 
-Post-clone Verification
+After cloning:
 
-After cloning and expansion:
+qm guest exec <vmid> -- df -h
+qm guest exec <vmid> -- lsblk
+qm guest exec <vmid> -- hostnamectl
 
-qm guest exec <new-vmid> -- df -h
-qm guest exec <new-vmid> -- lsblk
-qm guest exec <new-vmid> -- hostnamectl
+Verify:
 
-Ensure that the root filesystem shows the expanded size.
+Root filesystem expanded correctly
 
-Confirm the cloned VM hostname is updated.
+Hostname updated
 
-Verify SSH keys have been regenerated for security.
+Disk layout matches expectations
 
 Troubleshooting
+Guest agent not detected
 
-Disk expansion fails → check thin pool free space or adjust --expand size.
+Install and start the service inside the VM:
 
-Guest-agent not detected → install and start qemu-guest-agent in source VM.
+sudo systemctl enable --now qemu-guest-agent
+Disk expansion fails
 
-VMID conflicts → ensure --target VMID does not exist.
+Check available storage:
 
-Filesystem resize errors → verify root partition type (ext4 or xfs) matches the script logic.
+lvs
+vgs
+pvesm status
+VMID already exists
+
+Check existing VMs:
+
+qm list
+
+Use a different --target VMID.
 
 Logging
 
@@ -162,18 +249,21 @@ All operations are logged to:
 
 /var/log/proxmox-clone-expand.log
 
-Dry-run actions are clearly marked [DRY-RUN].
+Entries include:
 
-Errors are reported with timestamps for easy audit.
+timestamps
 
-Contributing
+dry-run indicators
 
-Fork the repository, make your changes, and submit pull requests.
+command output
 
-Ensure all modifications preserve dry-run functionality.
+error messages
 
-Do not remove or simplify logging, verification, or thin-pool checks.
+Updating the Tool
 
+Update the repository before running automation:
+
+git pull
 License
 
-This repository is released under the MIT License.
+MIT License
