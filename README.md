@@ -4,33 +4,28 @@
 
 This repository contains a **production-ready Bash tool** for cloning and expanding Proxmox VMs with full dry-run simulation, verbose logging, and real-time feedback. The script is designed for reliability, automation, and auditability.
 
-- Fully supports dry-run mode (`--dry-run`) for safe testing.
-- Logs all actions, progress, events, and errors to `/var/log/proxmox-clone-expand.log`.
+**Key features:**
+
+- Full dry-run simulation (`--dry-run`) to verify actions without making changes.
+- Logs all actions, progress, and errors to `/var/log/proxmox-clone-expand.log`.
 - Detects LVM vs non-LVM root partitions and resizes filesystems safely.
-- Automates hostname and SSH key updates after cloning.
-- Includes pre-flight checks, retries for guest-agent readiness, and post-clone verification.
+- Automates hostname, SSH key, and MAC address updates after cloning.
+- Pre-flight checks for VM existence, storage availability, and guest-agent readiness.
+- Supports multiple disk types (`scsi0`, `virtio0`, `sata0`) automatically.
+- Provides clear instructions and guidance for expanding Fedora/XFS and ext4 filesystems.
 
 ---
 
-## User Guide
+## Prerequisites
 
-### Prerequisites
+Before using the script:
 
-- Proxmox VE host with `qm` and `pvesm` CLI installed.
-- Source VM must have `qemu-guest-agent` installed and active.
-- Sufficient storage in the target storage pool for disk expansion.
-- Bash 4+ with `pipefail` support.
-
----
-
-### Usage
+1. **Proxmox VE host** with `qm` and `pvesm` CLI installed.
+2. **Source VM** must have `qemu-guest-agent` installed and active.
+3. **Storage space**: Ensure sufficient free space in the target storage pool for the clone and expansion.
+4. **Bash 4+** with `pipefail` support.
+5. **Optional but recommended**: Snapshot of source VM to prevent filesystem inconsistencies.
 
 ```bash
-# Dry-run simulation (safe, logs all actions)
-./proxmox-clone-expand.sh <source-vmid> <new-vmid> "<new-vm-name>" +<size>G --dry-run
-
-# Example: simulate cloning VM 101 to VM 102 with +200G expansion
-./proxmox-clone-expand.sh 101 102 "New-VM" +200G --dry-run
-
-# Live clone + expand
-./proxmox-clone-expand.sh 101 102 "New-VM" +200G
+# Create snapshot (optional but safest)
+qm snapshot <source-vmid> pre-clone
