@@ -164,24 +164,41 @@ else
     SNAP_ARG="--snapshot pre-clone"
 fi
 
+# --------------------------------------------------------------
+# Clone VM
+# --------------------------------------------------------------
 log "Cloning VM"
 run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true $SNAP_ARG
 
-detect_disk
-log "Expanding disk"
-run qm resize "$NEW_VMID" "$DISK" "$EXPAND_SIZE"
+# Wait until the VM exists
+log "Waiting for VM $NEW_VMID to appear in qm list..."
+waited=0
+until qm status "$NEW_VMID" >/dev/null 2>&1; do
+    sleep 2
+    waited=$((waited+2))
+    (( waited > 60 )) && { log "ERROR: Cloned VM $NEW_VMID did not appear"; exit 1; }
+done
 
+# Start VM
 log "Starting VM"
 run qm start "$NEW_VMID"
+
+# Wait for guest-agent
 [ "$DRY_RUN" = false ] && wait_guest_agent "$NEW_VMID" || log "[DRY-RUN] Guest agent wait simulated"
 
+# Detect disk and root partition after VM exists
+detect_disk
 detect_root_partition
+
+# Grow partition and expand filesystem
 run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM"
 expand_filesystem
 
+# Hostname and SSH setup
 run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME"
 run qm guest exec "$NEW_VMID" -- ssh-keygen -A
 
+# Post-clone verification
 verify_post_clone "$NEW_VMID"
 
 log "==== COMPLETE ===="
