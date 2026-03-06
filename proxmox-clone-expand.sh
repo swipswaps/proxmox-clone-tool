@@ -5,7 +5,7 @@ set -euo pipefail
 # Proxmox VM Clone + Expand Tool (Fully Upgraded)
 #
 # Features & Fixes:
-# • Snapshot creation skipped if 'pre-clone' exists
+# • Reliable snapshot existence detection via qm listsnapshot + exact name matching
 # • Automatic disk expansion after cloning
 # • Guest filesystem resize according to partition type
 # • Post-clone verification: df, lsblk, hostnamectl
@@ -28,7 +28,7 @@ MAX_GUEST_WAIT=180
 GUEST_RETRY_INTERVAL=5
 
 # --------------------------------------------------------------
-# Logging functions
+# Logging
 # --------------------------------------------------------------
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 
@@ -221,9 +221,9 @@ preflight_checks
 detect_storage
 check_storage
 
-# Snapshot handling: skip creation if 'pre-clone' exists
+# Snapshot handling: reliable detection
 if [ "$DRY_RUN" = false ]; then
-    if qm listsnapshot "$SOURCE_VMID" | awk 'NR>1 {gsub(/^[ \t]+|[ \t]+$/,""); print $1}' | grep -qx 'pre-clone'; then
+    if qm listsnapshot "$SOURCE_VMID" | awk 'NR>1 {print $1}' | grep -Fxq "pre-clone"; then
         log "Snapshot 'pre-clone' exists, skipping creation"
     else
         log "Creating snapshot 'pre-clone'"
@@ -239,7 +239,7 @@ run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true
 
 detect_disk
 
-# Expand disk to requested size
+# Expand disk
 log "Expanding disk"
 run qm resize "$NEW_VMID" "$DISK" "$EXPAND_SIZE"
 
