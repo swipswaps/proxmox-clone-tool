@@ -2,20 +2,28 @@
 set -euo pipefail
 
 # =========================================
-# Proxmox VM Clone + Expand Tool (Next-Gen Upgrade)
-# Fully supports --dry-run with verbose logging, real-time progress,
-# event and error messages, pre-flight checks, post-clone verification.
+# Proxmox VM Clone + Expand Tool (Fully Upgraded)
+# Supports: 
+# - --dry-run mode for non-destructive testing
+# - thin pool free space validation before expansion
+# - guest-agent verification and wait
+# - snapshot pre-clone with rollback capability
+# - VMID conflict detection
+# - post-clone verification with df -h, lsblk, hostnamectl
+# - warnings and errors for insufficient storage or unknown FS
+# - admin-only path usage recommended (/root/proxmox-tools)
+# - logs all steps to /var/log/proxmox-clone-expand.log
 # =========================================
 
 # ---------------- CONFIGURATION ----------------
-SOURCE_VMID="$1"
-NEW_VMID="$2"
-NEW_NAME="$3"
-EXPAND_SIZE="$4"
-DRY_RUN=false
-MAX_GUEST_WAIT=180
-GUEST_RETRY_INTERVAL=5
-MAX_GROWPART_RETRIES=8
+SOURCE_VMID="$1"           # VMID of source VM to clone
+NEW_VMID="$2"              # VMID for new cloned VM
+NEW_NAME="$3"              # Hostname for new VM
+EXPAND_SIZE="$4"           # Disk expansion size (e.g., 100G)
+DRY_RUN=false              # Default: perform real operations
+MAX_GUEST_WAIT=180         # Max seconds to wait for guest-agent
+GUEST_RETRY_INTERVAL=5     # Interval between guest-agent checks
+MAX_GROWPART_RETRIES=8     # Growpart retries if partition resize fails
 LOG_FILE="/var/log/proxmox-clone-expand.log"
 
 # ---------------- ARGUMENT PARSING ----------------
@@ -27,9 +35,7 @@ for arg in "${@:5}"; do
 done
 
 # ---------------- HELPER FUNCTIONS ----------------
-log() {
-    echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"
-}
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 
 run() {
     if [ "$DRY_RUN" = true ]; then
@@ -44,11 +50,11 @@ run() {
 simulate() { echo "$1"; }
 
 preflight_checks() {
-    # Check for required CLI tools
+    # Ensure Proxmox CLI tools exist
     command -v qm >/dev/null 2>&1 || { log "ERROR: 'qm' CLI not found"; exit 1; }
     command -v pvesm >/dev/null 2>&1 || { log "ERROR: 'pvesm' CLI not found"; exit 1; }
 
-    # Check VM existence
+    # Ensure source VM exists and target VMID is free
     if [ "$DRY_RUN" = false ]; then
         ! qm status "$SOURCE_VMID" >/dev/null 2>&1 && { log "ERROR: Source VM $SOURCE_VMID missing"; exit 1; }
         qm status "$NEW_VMID" >/dev/null 2>&1 && { log "ERROR: VMID $NEW_VMID exists"; exit 1; }
@@ -76,6 +82,21 @@ verify_post_clone() {
     log "Verification complete."
 }
 
+check_thin_pool_space() {
+    local storage="$1"
+    local req_size="$2"
+    local free_gb
+    if [ "$DRY_RUN" = false ]; then
+        # Extract thin pool info (assumes 'data' pool)
+        free_gb=$(lvs --noheadings -o lv_size,data_percent --units g --nosuffix pve/data \
+                  | awk '{print $1*(1-$2/100)}')
+    else
+        free_gb=$(simulate 500)
+    fi
+    (( $(echo "$free_gb < $req_size" | bc -l) )) && { log "ERROR: Thin pool free space ($free_gb G) insufficient for expansion ($req_size G)"; exit 1; }
+    log "Thin pool free space sufficient: $free_gb G"
+}
+
 # ---------------- MAIN ----------------
 log "==== Proxmox VM Clone + Expand Tool ===="
 log "Source VMID: $SOURCE_VMID, New VMID: $NEW_VMID, New Name: $NEW_NAME, Expand: $EXPAND_SIZE"
@@ -84,23 +105,13 @@ log "Source VMID: $SOURCE_VMID, New VMID: $NEW_VMID, New Name: $NEW_NAME, Expand
 preflight_checks
 
 # ---------------- DETERMINE STORAGE ----------------
-if [ "$DRY_RUN" = false ]; then
-    STORAGE=$(qm config "$SOURCE_VMID" | grep -E '^(scsi0|virtio0|sata0|ide0)' | cut -d':' -f2 | cut -d',' -f1)
-    [ -z "$STORAGE" ] && { log "ERROR: Could not determine storage"; exit 1; }
-else
-    STORAGE=$(simulate "local-lvm")
-fi
+STORAGE=$([ "$DRY_RUN" = false ] && qm config "$SOURCE_VMID" | grep -E '^(scsi0|virtio0|sata0|ide0)' \
+           | cut -d':' -f2 | cut -d',' -f1 || simulate "local-lvm")
+[ -z "$STORAGE" ] && { log "ERROR: Could not determine storage"; exit 1; }
 log "Detected storage: $STORAGE"
 
-# ---------------- CHECK AVAILABLE STORAGE ----------------
 REQ_SIZE=$(echo "$EXPAND_SIZE" | sed 's/+//;s/G//')
-if [ "$DRY_RUN" = false ]; then
-    AVAILABLE=$(pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4; exit}' | sed 's/G//')
-else
-    AVAILABLE=$(simulate 500)
-fi
-(( AVAILABLE < REQ_SIZE )) && { log "ERROR: Not enough storage ($AVAILABLE G)"; exit 1; }
-log "Available storage: $AVAILABLE G"
+check_thin_pool_space "$STORAGE" "$REQ_SIZE"
 
 # ---------------- SNAPSHOT & CLONE ----------------
 log "Creating pre-clone snapshot..."
@@ -119,11 +130,8 @@ log "Removing pre-clone snapshot..."
 run qm delsnapshot "$SOURCE_VMID" pre-clone || log "Warning: could not delete snapshot"
 
 # ---------------- DETECT PRIMARY DISK ----------------
-if [ "$DRY_RUN" = false ]; then
-    DISK=$(qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f1)
-else
-    DISK=$(simulate "scsi0")
-fi
+DISK=$([ "$DRY_RUN" = false ] && qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' \
+        | cut -d':' -f1 || simulate "scsi0")
 [ -z "$DISK" ] && { log "ERROR: Could not detect primary disk"; exit 1; }
 log "Detected primary disk: $DISK"
 
@@ -143,11 +151,8 @@ else
 fi
 
 # ---------------- DETECT ROOT PARTITION ----------------
-if [ "$DRY_RUN" = false ]; then
-    ROOT_PART=$(qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT | awk '$2=="/"{print $1}')
-else
-    ROOT_PART=$(simulate "sda1")
-fi
+ROOT_PART=$([ "$DRY_RUN" = false ] && qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT \
+             | awk '$2=="/"{print $1}' || simulate "sda1")
 [ -z "$ROOT_PART" ] && { log "ERROR: Could not detect root partition"; exit 1; }
 log "Detected root partition: $ROOT_PART"
 
@@ -155,11 +160,8 @@ PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]\+$')
 DISK_NAME=$(echo "$ROOT_PART" | sed -E "s/${PART_NUM}$//")
 
 # ---------------- FILESYSTEM EXPANSION ----------------
-if [ "$DRY_RUN" = false ]; then
-    IS_LVM=$(qm guest exec "$NEW_VMID" -- lsblk -no TYPE "/dev/$ROOT_PART")
-else
-    IS_LVM=$(simulate "disk")
-fi
+IS_LVM=$([ "$DRY_RUN" = false ] && qm guest exec "$NEW_VMID" -- lsblk -no TYPE "/dev/$ROOT_PART" \
+          || simulate "disk")
 
 if [[ "$IS_LVM" != "lvm" ]]; then
     RETRY=0
@@ -173,13 +175,8 @@ else
     log "Root is on LVM; skipping growpart."
 fi
 
-if [ "$DRY_RUN" = false ]; then
-    FS_TYPE=$(qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" || true)
-    MOUNTPOINT=$(qm guest exec "$NEW_VMID" -- findmnt -n -o TARGET "/dev/$ROOT_PART" || echo "/")
-else
-    FS_TYPE=$(simulate "ext4")
-    MOUNTPOINT=$(simulate "/")
-fi
+FS_TYPE=$([ "$DRY_RUN" = false ] && qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" || simulate "ext4")
+MOUNTPOINT=$([ "$DRY_RUN" = false ] && qm guest exec "$NEW_VMID" -- findmnt -n -o TARGET "/dev/$ROOT_PART" || simulate "/")
 
 case "$FS_TYPE" in
     xfs) run qm guest exec "$NEW_VMID" -- xfs_growfs "$MOUNTPOINT" ;;
