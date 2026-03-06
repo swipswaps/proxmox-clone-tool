@@ -67,7 +67,6 @@ run() {
 simulate() { echo "$1"; }
 
 
-
 # --------------------------------------------------------------
 # Argument parsing
 # --------------------------------------------------------------
@@ -227,7 +226,8 @@ detect_storage() {
         STORAGE=$(qm config "$SOURCE_VMID" \
             | grep -E '^(scsi|virtio|sata|ide)0' \
             | cut -d':' -f2 \
-            | cut -d',' -f1)
+            | cut -d',' -f1 \
+            | xargs)   # <-- trim leading/trailing whitespace
 
     else
         STORAGE=$(simulate "local-lvm")
