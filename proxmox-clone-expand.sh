@@ -2,10 +2,13 @@
 set -euo pipefail
 
 # ==============================================================
-# Proxmox VM Clone + Expand Tool (PRF-Compliant, Fully Upgraded)
-# Includes detailed logic checks at every step
-# Handles timestamped snapshots to avoid name collisions
-# Dry-run mode is fully safe with numeric simulation
+# Proxmox VM Clone + Expand Tool (Fully Audit-Informed, Hardened)
+# Features:
+# - VM config & guest-agent readiness
+# - Storage & filesystem checks
+# - Timestamped snapshot
+# - Dry-run fully supported
+# - Full logic checks, retries, and detailed logging
 # ==============================================================
 
 LOG_FILE="/var/log/proxmox-clone-expand.log"
@@ -19,7 +22,6 @@ GUEST_RETRY_INTERVAL=5
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
 run() { [ "$DRY_RUN" = true ] && log "[DRY-RUN] $*" || { log "[RUN] $*"; eval "$@" 2>&1 | tee -a "$LOG_FILE"; return "${PIPESTATUS[0]}"; } }
-simulate() { echo "$1"; }
 
 # --------------------------------------------------------------
 # Argument parsing
@@ -57,7 +59,7 @@ preflight_checks() {
 }
 
 # --------------------------------------------------------------
-# Wait for guest-agent
+# Wait for guest-agent readiness
 # --------------------------------------------------------------
 wait_guest_agent() {
     local vm="$1"
@@ -73,11 +75,11 @@ wait_guest_agent() {
 }
 
 # --------------------------------------------------------------
-# Detect storage & disk
+# Storage detection and check
 # --------------------------------------------------------------
 detect_storage() {
     log "Detecting storage for VM $SOURCE_VMID..."
-    STORAGE=$( [ "$DRY_RUN" = true ] && "local-lvm" || qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs )
+    STORAGE=$( [ "$DRY_RUN" = true ] && echo "local-lvm" || qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs )
     [[ -z "$STORAGE" ]] && { log "ERROR: could not detect storage"; exit 1; }
     log "Detected storage: $STORAGE"
 }
@@ -94,16 +96,61 @@ check_storage() {
     log "Storage sufficient: $free G available"
 }
 
+# --------------------------------------------------------------
+# Snapshot creation with timestamp
+# --------------------------------------------------------------
+prepare_snapshot() {
+    local vm="$1"
+    local timestamp
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    local snap_name="pre-clone-$timestamp"
+    log "Snapshot name set to: $snap_name"
+    if [ "$DRY_RUN" = false ]; then
+        run qm snapshot "$vm" "$snap_name"
+    else
+        log "[DRY-RUN] Snapshot handling simulated with name $snap_name"
+    fi
+    SNAP_NAME="$snap_name"
+}
+
+# --------------------------------------------------------------
+# Wait for VM config after clone
+# --------------------------------------------------------------
+wait_vm_config() {
+    log "Waiting for VM $NEW_VMID config..."
+    local tries=0
+    while [ "$tries" -lt 20 ]; do
+        if [ "$DRY_RUN" = true ] || [ -f "/etc/pve/qemu-server/${NEW_VMID}.conf" ]; then
+            log "VM $NEW_VMID config detected."
+            return
+        fi
+        log "VM config not found yet, retrying..."
+        sleep 2
+        tries=$((tries+1))
+    done
+    log "ERROR: VM config for $NEW_VMID not found"; exit 1
+}
+
+# --------------------------------------------------------------
+# Disk and root partition detection
+# --------------------------------------------------------------
 detect_disk() {
     log "Detecting primary disk for VM $NEW_VMID..."
-    DISK=$( [ "$DRY_RUN" = true ] && "scsi0" || qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f1 )
-    [[ -z "$DISK" ]] && { log "ERROR: cannot detect disk"; exit 1; }
-    log "Primary disk detected: $DISK"
+    local tries=0
+    while [ "$tries" -lt 20 ]; do
+        DISK=$( [ "$DRY_RUN" = true ] && echo "scsi0" || qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f1 )
+        [[ -n "$DISK" ]] && { log "Primary disk detected: $DISK"; return; }
+        log "Disk not found yet, retrying..."
+        sleep 2
+        tries=$((tries+1))
+    done
+    log "ERROR: cannot detect disk after multiple retries"; exit 1
 }
 
 detect_root_partition() {
     log "Detecting root partition for VM $NEW_VMID..."
-    ROOT_PART=$( [ "$DRY_RUN" = true ] && "sda1" || qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT | awk '$2=="/"{print $1}' )
+    wait_guest_agent "$NEW_VMID"
+    ROOT_PART=$( [ "$DRY_RUN" = true ] && echo "sda1" || qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT | awk '$2=="/"{print $1}' )
     [[ -z "$ROOT_PART" ]] && { log "ERROR: root partition detection failed"; exit 1; }
     log "Root partition detected: $ROOT_PART"
     PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]\+$')
@@ -116,7 +163,7 @@ detect_root_partition() {
 # --------------------------------------------------------------
 expand_filesystem() {
     log "Expanding filesystem on /dev/$ROOT_PART..."
-    local FS_TYPE=$( [ "$DRY_RUN" = true ] && "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" )
+    local FS_TYPE=$( [ "$DRY_RUN" = true ] && echo "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" )
     log "Detected filesystem type: $FS_TYPE"
     case "$FS_TYPE" in
         xfs) run qm guest exec "$NEW_VMID" -- xfs_growfs / ;;
@@ -128,7 +175,7 @@ expand_filesystem() {
 }
 
 # --------------------------------------------------------------
-# Verification
+# Post-clone verification
 # --------------------------------------------------------------
 verify_post_clone() {
     local vm="$1"
@@ -137,26 +184,6 @@ verify_post_clone() {
     run qm guest exec "$vm" -- lsblk
     run qm guest exec "$vm" -- hostnamectl
     log "Post-clone verification complete."
-}
-
-# --------------------------------------------------------------
-# Snapshot handling with timestamp to avoid name collisions
-# --------------------------------------------------------------
-prepare_snapshot() {
-    local vm="$1"
-    TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
-    SNAP_NAME="pre-clone"
-    if [ "$DRY_RUN" = false ]; then
-        EXISTING=$(qm listsnapshot "$vm" 2>/dev/null | awk 'NR>1{print $1}' | grep -Fx "$SNAP_NAME" || true)
-        if [[ -n "$EXISTING" ]]; then
-            SNAP_NAME="pre-clone-$TIMESTAMP"
-            log "Snapshot $SNAP_NAME exists, using timestamped name instead: $SNAP_NAME"
-        fi
-        log "Creating snapshot '$SNAP_NAME'"
-        run qm snapshot "$vm" "$SNAP_NAME"
-    else
-        log "[DRY-RUN] Snapshot handling simulated with name $SNAP_NAME"
-    fi
 }
 
 # --------------------------------------------------------------
@@ -175,47 +202,27 @@ preflight_checks
 detect_storage
 check_storage
 
-# Snapshot
 prepare_snapshot "$SOURCE_VMID"
-SNAP_ARG="--snapshot $SNAP_NAME"
 
-# Clone VM
 log "Cloning VM $SOURCE_VMID to $NEW_VMID..."
-run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true $SNAP_ARG
+run qm clone "$SOURCE_VMID" "$NEW_VMID" --name "$NEW_NAME" --full true --snapshot "$SNAP_NAME"
 
-# Wait until VM exists
-log "Waiting for VM $NEW_VMID to appear..."
-waited=0
-until qm status "$NEW_VMID" >/dev/null 2>&1 || [ "$DRY_RUN" = true ]; do
-    sleep 2
-    waited=$((waited+2))
-    log "Waiting for VM ($waited sec)"
-    (( waited > 60 )) && { log "ERROR: Cloned VM did not appear in qm list"; exit 1; }
-done
-log "VM $NEW_VMID detected (or simulated in dry-run)"
+wait_vm_config
 
-# Start VM
 log "Starting VM $NEW_VMID..."
 run qm start "$NEW_VMID"
 
-# Wait guest-agent
-[ "$DRY_RUN" = false ] && wait_guest_agent "$NEW_VMID" || log "[DRY-RUN] Guest agent wait simulated"
-
-# Detect disk & root partition
 detect_disk
 detect_root_partition
 
-# Grow partition and expand filesystem
 log "Growing partition..."
 run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM"
 expand_filesystem
 
-# Hostname and SSH
 log "Setting hostname and generating SSH keys..."
 run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME"
 run qm guest exec "$NEW_VMID" -- ssh-keygen -A
 
-# Verification
 verify_post_clone "$NEW_VMID"
 
 log "==== COMPLETE ===="
