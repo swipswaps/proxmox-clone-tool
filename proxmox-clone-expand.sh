@@ -5,14 +5,14 @@ set -euo pipefail
 # Proxmox VM Clone + Expand Tool (Fully Upgraded)
 #
 # Features & Fixes:
-# • Correct snapshot existence detection to avoid duplicate "pre-clone"
+# • Snapshot creation skipped if 'pre-clone' exists
 # • Automatic disk expansion after cloning
 # • Guest filesystem resize according to partition type
-# • Post-clone verification: df, lsblk, hostname
+# • Post-clone verification: df, lsblk, hostnamectl
 # • Dry-run mode for safe simulation
 # • Pre-flight validation for source VM and target VMID
 # • Full logging to /var/log/proxmox-clone-expand.log
-# • Handles LVM, ext4, xfs, btrfs filesystems
+# • Supports LVM, ext4, xfs, btrfs
 # • Waits for qemu-guest-agent before filesystem expansion
 # ==============================================================
 
@@ -26,7 +26,6 @@ DRY_RUN=false
 
 MAX_GUEST_WAIT=180
 GUEST_RETRY_INTERVAL=5
-MAX_GROWPART_RETRIES=8
 
 # --------------------------------------------------------------
 # Logging functions
@@ -133,11 +132,7 @@ verify_post_clone() {
 # --------------------------------------------------------------
 detect_storage() {
     if [ "$DRY_RUN" = false ]; then
-        STORAGE=$(qm config "$SOURCE_VMID" \
-            | grep -E '^(scsi|virtio|sata|ide)0' \
-            | cut -d':' -f2 \
-            | cut -d',' -f1 \
-            | xargs)
+        STORAGE=$(qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs)
     else
         STORAGE=$(simulate "local-lvm")
     fi
@@ -226,14 +221,12 @@ preflight_checks
 detect_storage
 check_storage
 
-# Snapshot handling: skip creation if "pre-clone" exists
+# Snapshot handling: skip creation if 'pre-clone' exists
 if [ "$DRY_RUN" = false ]; then
-    if qm listsnapshot "$SOURCE_VMID" \
-        | awk 'NR>1{gsub(/^[ \t]+|[ \t]+$/,""); print $1}' \
-        | grep -qx 'pre-clone'; then
+    if qm listsnapshot "$SOURCE_VMID" | awk 'NR>1 {gsub(/^[ \t]+|[ \t]+$/,""); print $1}' | grep -qx 'pre-clone'; then
         log "Snapshot 'pre-clone' exists, skipping creation"
     else
-        log "Creating snapshot"
+        log "Creating snapshot 'pre-clone'"
         run qm snapshot "$SOURCE_VMID" pre-clone
     fi
 else
@@ -254,7 +247,7 @@ run qm resize "$NEW_VMID" "$DISK" "$EXPAND_SIZE"
 log "Starting VM"
 run qm start "$NEW_VMID"
 
-# Wait for guest agent if not dry-run
+# Wait for guest agent
 [ "$DRY_RUN" = false ] && wait_guest_agent "$NEW_VMID" || log "[DRY-RUN] Guest agent wait simulated"
 
 # Detect root partition and expand filesystem
