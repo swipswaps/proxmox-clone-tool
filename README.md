@@ -27,5 +27,65 @@ Before using the script:
 5. **Optional but recommended**: Snapshot of source VM to prevent filesystem inconsistencies.
 
 ```bash
+# Make the script executable
+chmod +x proxmox-clone-expand.sh
+
 # Create snapshot (optional but safest)
 qm snapshot <source-vmid> pre-clone
+Usage
+Dry-run Simulation (Safe)
+
+This mode verifies all actions without making changes. Logs are saved for review.
+
+./proxmox-clone-expand.sh <source-vmid> <new-vmid> "<new-vm-name>" +<size>G --dry-run
+
+# Example: simulate cloning VM 101 to VM 102 with +200G expansion
+./proxmox-clone-expand.sh 101 102 "New-VM" +200G --dry-run
+Live Clone + Expand
+
+Once verified, run the script to perform the actual clone and expansion.
+
+./proxmox-clone-expand.sh <source-vmid> <new-vmid> "<new-vm-name>" +<size>G
+
+# Example: clone VM 101 to VM 102 with +200G expansion
+./proxmox-clone-expand.sh 101 102 "New-VM" +200G
+Post-Clone Verification
+
+After the clone:
+
+Confirm the VM boots successfully.
+
+Check that the filesystem expansion completed as expected:
+
+df -h
+lsblk
+
+Verify SSH access and hostname updates:
+
+ssh root@<new-vm-ip>
+hostname
+
+Confirm that the Proxmox VM configuration reflects correct disk sizes and MAC addresses:
+
+qm config <new-vmid>
+Notes & Best Practices
+
+Always run the script in --dry-run mode first.
+
+Snapshots of source VMs are highly recommended to avoid filesystem inconsistencies.
+
+The script supports common disk types (scsi0, virtio0, sata0) and detects LVM vs non-LVM automatically.
+
+Logs at /var/log/proxmox-clone-expand.log include verbose step-by-step actions for auditing and troubleshooting.
+
+Ensure sufficient free space in the target storage pool to accommodate the expanded disk.
+
+Support & References
+
+This tool was developed following best practices observed in:
+
+Proxmox official forums: https://forum.proxmox.com/
+
+Popular GitHub repositories for VM cloning and automation
+
+Reputable user guides and articles on LVM and filesystem expansion
