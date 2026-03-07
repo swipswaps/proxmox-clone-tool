@@ -52,12 +52,25 @@ detect_storage() {
     log "Detecting storage for VM $SOURCE_VMID..."
     STORAGE=$( [ "$DRY_RUN" = true ] && echo "local-lvm" || qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs )
     [[ -z "$STORAGE" ]] && { log "ERROR: could not detect storage"; exit 1; }
-    if [ "$DRY_RUN" = false ] && ! vgs "$STORAGE" >/dev/null 2>&1; then log "ERROR: Volume group $STORAGE not found"; exit 1; fi
-    log "Storage verified: $STORAGE"
+
+    # Determine storage type robustly
+    if vgs "$STORAGE" >/dev/null 2>&1; then
+        STORAGE_TYPE="lvm"
+    elif zfs list "$STORAGE" >/dev/null 2>&1; then
+        STORAGE_TYPE="zfs"
+    elif [ -d "/mnt/$STORAGE" ]; then
+        STORAGE_TYPE="dir"
+    elif rbd showmapped | grep -q "$STORAGE"; then
+        STORAGE_TYPE="ceph"
+    else
+        log "ERROR: Unknown or inaccessible storage type: $STORAGE"; exit 1
+    fi
+
+    log "Storage verified: $STORAGE (type=$STORAGE_TYPE)"
 }
 
 check_existing_snapshots() {
-    log "Checking for pre-existing snapshots..."
+    log "Checking for snapshots..."
     if [ "$DRY_RUN" = false ]; then
         SNAP_WARN=$(qm listsnapshot "$SOURCE_VMID" 2>/dev/null || true)
         [[ -n "$SNAP_WARN" ]] && log "Existing snapshots:\n$SNAP_WARN"
@@ -66,25 +79,20 @@ check_existing_snapshots() {
 }
 
 check_storage() {
-    log "Checking available storage and thin pool overcommit..."
+    log "Checking available storage..."
     local req=$(echo "$EXPAND_SIZE" | sed 's/G//')
     local free
     free=$( [ "$DRY_RUN" = true ] && echo "500" || pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4}' | sed 's/G//' )
     if ! [[ "$free" =~ ^[0-9]+$ ]]; then log "ERROR: Storage check failed ($free)"; exit 1; fi
     (( free < req )) && { log "ERROR: insufficient storage ($free G < $req G)"; exit 1; }
-    # Thin pool overcommit check
-    if [ "$DRY_RUN" = false ]; then
-        THIN_TOTAL=$(lvs --noheadings -o lv_size --units G --nosuffix "$STORAGE" 2>/dev/null | awk '{s+=$1} END{print s}')
-        (( THIN_TOTAL > free )) && { log "ERROR: Thin pool overcommit detected ($THIN_TOTAL G > $free G)"; exit 1; }
-    fi
-    log "Storage sufficient and thin pool check passed."
+    log "Sufficient storage: $free G"
 }
 
 prepare_snapshot() {
     local ts=$(date '+%Y%m%d-%H%M%S')
     SNAP_NAME="pre-clone-$ts"
     log "Creating snapshot: $SNAP_NAME"
-    [ "$DRY_RUN" = false ] && run qm snapshot "$SOURCE_VMID" "$SNAP_NAME" || log "[DRY-RUN] Snapshot simulated"
+    [ "$DRY_RUN" = false ] && run qm snapshot "$SOURCE_VMID" "$SNAP_NAME" || log "[DRY-RUN] Snapshot $SNAP_NAME simulated"
 }
 
 wait_vm_config() {
@@ -127,15 +135,15 @@ expand_filesystem() {
     local FS_TYPE=$( [ "$DRY_RUN" = true ] && echo "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" )
     log "Filesystem type: $FS_TYPE"
     case "$FS_TYPE" in
-        xfs) run qm guest exec "$NEW_VMID" -- xfs_growfs / ;;
-        ext2|ext3|ext4) run qm guest exec "$NEW_VMID" -- resize2fs "/dev/$ROOT_PART" ;;
-        btrfs) run qm guest exec "$NEW_VMID" -- btrfs filesystem resize max / ;;
-        *) log "WARNING: Unknown filesystem $FS_TYPE" ;;
+        xfs) run qm guest exec "$NEW_VMID" -- bash -c "command -v xfs_growfs >/dev/null || exit 1; xfs_growfs /" ;;
+        ext2|ext3|ext4) run qm guest exec "$NEW_VMID" -- bash -c "command -v resize2fs >/dev/null || exit 1; resize2fs /dev/$ROOT_PART" ;;
+        btrfs) run qm guest exec "$NEW_VMID" -- bash -c "command -v btrfs >/dev/null || exit 1; btrfs filesystem resize max /" ;;
+        *) log "WARNING: Unknown filesystem $FS_TYPE; skipping resize" ;;
     esac
 }
 
 verify_post_clone() {
-    log "Running post-clone verification..."
+    log "Verifying post-clone VM state..."
     run qm guest exec "$NEW_VMID" -- df -h
     run qm guest exec "$NEW_VMID" -- lsblk
     run qm guest exec "$NEW_VMID" -- hostnamectl
