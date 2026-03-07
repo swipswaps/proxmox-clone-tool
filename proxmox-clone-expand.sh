@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ======================= CONFIG =======================
 LOG_FILE="/var/log/proxmox-clone-expand.log"
 SOURCE_VMID=""
 NEW_VMID=""
@@ -21,6 +22,7 @@ run() {
     fi
 }
 
+# ==================== ARG PARSING =====================
 parse_args() {
     log "Parsing arguments..."
     while [[ $# -gt 0 ]]; do
@@ -33,10 +35,13 @@ parse_args() {
             *) log "ERROR: Unknown argument $1"; exit 1 ;;
         esac
     done
-    [[ -z "$SOURCE_VMID" || -z "$NEW_VMID" || -z "$NEW_NAME" || -z "$EXPAND_SIZE" ]] && { log "ERROR: Missing required arguments"; exit 1; }
+    [[ -z "$SOURCE_VMID" || -z "$NEW_VMID" || -z "$NEW_NAME" || -z "$EXPAND_SIZE" ]] && {
+        log "ERROR: Missing required arguments"; exit 1; 
+    }
     log "Arguments OK: source=$SOURCE_VMID, target=$NEW_VMID, name=$NEW_NAME, expand=$EXPAND_SIZE, dry-run=$DRY_RUN"
 }
 
+# =================== PRE-FLIGHT CHECKS ==================
 preflight_checks() {
     log "Running pre-flight checks..."
     command -v qm >/dev/null || { log "ERROR: qm CLI not found"; exit 1; }
@@ -48,12 +53,16 @@ preflight_checks() {
     log "Pre-flight checks passed."
 }
 
+# ================= STORAGE DETECTION ==================
 detect_storage() {
     log "Detecting storage for VM $SOURCE_VMID..."
-    STORAGE=$( [ "$DRY_RUN" = true ] && echo "local-lvm" || qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f2 | cut -d',' -f1 | xargs )
+    if [ "$DRY_RUN" = true ]; then
+        STORAGE="local-lvm"
+    else
+        STORAGE=$(qm config "$SOURCE_VMID" | grep -E '^(scsi|virtio|sata|ide)[0-9]+' | head -1 | cut -d':' -f2 | cut -d',' -f1 | xargs)
+    fi
     [[ -z "$STORAGE" ]] && { log "ERROR: could not detect storage"; exit 1; }
 
-    # Determine storage type robustly
     if vgs "$STORAGE" >/dev/null 2>&1; then
         STORAGE_TYPE="lvm"
     elif zfs list "$STORAGE" >/dev/null 2>&1; then
@@ -69,6 +78,7 @@ detect_storage() {
     log "Storage verified: $STORAGE (type=$STORAGE_TYPE)"
 }
 
+# =============== SNAPSHOT & STORAGE CHECK ===============
 check_existing_snapshots() {
     log "Checking for snapshots..."
     if [ "$DRY_RUN" = false ]; then
@@ -82,7 +92,11 @@ check_storage() {
     log "Checking available storage..."
     local req=$(echo "$EXPAND_SIZE" | sed 's/G//')
     local free
-    free=$( [ "$DRY_RUN" = true ] && echo "500" || pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4}' | sed 's/G//' )
+    if [ "$DRY_RUN" = true ]; then
+        free=500
+    else
+        free=$(pvesm status -storage "$STORAGE" | awk 'NR>1 {print $4}' | sed 's/G//' | head -1)
+    fi
     if ! [[ "$free" =~ ^[0-9]+$ ]]; then log "ERROR: Storage check failed ($free)"; exit 1; fi
     (( free < req )) && { log "ERROR: insufficient storage ($free G < $req G)"; exit 1; }
     log "Sufficient storage: $free G"
@@ -95,6 +109,7 @@ prepare_snapshot() {
     [ "$DRY_RUN" = false ] && run qm snapshot "$SOURCE_VMID" "$SNAP_NAME" || log "[DRY-RUN] Snapshot $SNAP_NAME simulated"
 }
 
+# ================= VM CONFIG & DISK ===================
 wait_vm_config() {
     log "Waiting for VM $NEW_VMID config..."
     local tries=0
@@ -110,29 +125,38 @@ detect_disk() {
     log "Detecting primary disk..."
     local tries=0
     while [ "$tries" -lt $MAX_RETRIES ]; do
-        DISK=$( [ "$DRY_RUN" = true ] && echo "scsi0" || qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)0' | cut -d':' -f1 )
+        DISK=$( [ "$DRY_RUN" = true ] && echo "scsi0" || qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)[0-9]+' | head -1 | cut -d':' -f1 )
         [[ -n "$DISK" ]] && { log "Disk detected: $DISK"; return; }
         log "Disk not ready, retrying..."; sleep $RETRY_INTERVAL; ((tries++))
     done
     log "ERROR: Cannot detect disk"; exit 1
 }
 
+# ================= ROOT PARTITION DETECTION ==============
 detect_root_partition() {
-    log "Detecting root partition via guest agent..."
+    log "Detecting root partition via guest agent with fallback..."
     local tries=0
     while [ "$tries" -lt $MAX_RETRIES ]; do
-        ROOT_PART=$( [ "$DRY_RUN" = true ] && echo "sda1" || qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT | awk '$2=="/"{print $1}' )
+        ROOT_PART=$( [ "$DRY_RUN" = true ] && echo "sda1" || qm guest exec "$NEW_VMID" -- lsblk -ln -o NAME,MOUNTPOINT 2>/dev/null | awk '$2=="/"{print $1}' )
         [[ -n "$ROOT_PART" ]] && break
         log "Root partition not detected, retrying..."; sleep $RETRY_INTERVAL; ((tries++))
     done
+
+    # Fallback to first partition on primary disk if guest agent failed
+    if [[ -z "$ROOT_PART" && "$DRY_RUN" = false ]]; then
+        ROOT_PART=$(qm config "$NEW_VMID" | grep -E '^(scsi|virtio|sata|ide)[0-9]+' | head -1 | cut -d':' -f2 | cut -d',' -f1 | xargs echo | sed 's/$/1/')
+        log "Fallback root partition: $ROOT_PART"
+    fi
+
     [[ -z "$ROOT_PART" ]] && { log "ERROR: root partition not found"; exit 1; }
     PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]\+$')
     DISK_NAME=$(echo "$ROOT_PART" | sed -E "s/${PART_NUM}$//")
     log "Root partition: $ROOT_PART, Disk=$DISK_NAME, Part#=$PART_NUM"
 }
 
+# ================= FILESYSTEM EXPANSION =================
 expand_filesystem() {
-    local FS_TYPE=$( [ "$DRY_RUN" = true ] && echo "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" )
+    local FS_TYPE=$( [ "$DRY_RUN" = true ] && echo "ext4" || qm guest exec "$NEW_VMID" -- blkid -o value -s TYPE "/dev/$ROOT_PART" 2>/dev/null )
     log "Filesystem type: $FS_TYPE"
     case "$FS_TYPE" in
         xfs) run qm guest exec "$NEW_VMID" -- bash -c "command -v xfs_growfs >/dev/null || exit 1; xfs_growfs /" ;;
@@ -142,14 +166,15 @@ expand_filesystem() {
     esac
 }
 
+# ================= POST CLONE VERIFICATION =============
 verify_post_clone() {
     log "Verifying post-clone VM state..."
-    run qm guest exec "$NEW_VMID" -- df -h
-    run qm guest exec "$NEW_VMID" -- lsblk
-    run qm guest exec "$NEW_VMID" -- hostnamectl
+    run qm guest exec "$NEW_VMID" -- df -h || log "Warning: df failed"
+    run qm guest exec "$NEW_VMID" -- lsblk || log "Warning: lsblk failed"
+    run qm guest exec "$NEW_VMID" -- hostnamectl || log "Warning: hostnamectl failed"
 }
 
-# ------------------------- MAIN ------------------------------
+# ======================= MAIN ==========================
 parse_args "$@"
 log "==== START Proxmox Clone + Expand ===="
 preflight_checks
@@ -162,9 +187,9 @@ wait_vm_config
 run qm start "$NEW_VMID"
 detect_disk
 detect_root_partition
-run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM"
+run qm guest exec "$NEW_VMID" -- growpart "$DISK_NAME" "$PART_NUM" || log "Warning: growpart failed"
 expand_filesystem
-run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME"
-run qm guest exec "$NEW_VMID" -- ssh-keygen -A
+run qm guest exec "$NEW_VMID" -- hostnamectl set-hostname "$NEW_NAME" || log "Warning: hostnamectl failed"
+run qm guest exec "$NEW_VMID" -- ssh-keygen -A || log "Warning: ssh-keygen failed"
 verify_post_clone
 log "==== COMPLETE ===="
